@@ -11,7 +11,8 @@ from .config import settings
 from .database import AsyncSessionFactory, Message
 
 # 使用與 web/worker 一致的日誌記錄器
-logger = logging.getLogger("web") or logging.getLogger("worker")
+# 這樣在 Railway 上查看日誌時，來源才會一致
+logger = logging.getLogger("worker")
 
 # --- 初始化 OpenAI 客戶端 ---
 aclient: Optional[AsyncOpenAI] = None
@@ -68,24 +69,41 @@ async def summarize_for_all_chats(http_client: httpx.AsyncClient):
                     logger.info(f"Chat {chat_id} 訊息過少 ({len(messages)}則)，跳過摘要。")
                     continue
 
-                # 4. 呼叫 OpenAI 產生摘要
-                logger.info(f"正在為 Chat {chat_id} 產生摘要 ({len(messages)}則訊息)...")
-                summary_prompt = (
-                    "你是一位專業的會議記錄員，請根據以下聊天紀錄，整理出一份簡潔、清晰、條列式的繁體中文摘要，並忽略無關緊要的閒聊。\n"
-                    f"摘要的開頭必須是：「以下是 {date_str} 的對話摘要：」\n\n"
-                    "聊天紀錄如下：\n---\n"
-                    + "\n".join(f"- {m}" for m in messages)
-                )
+                # 4. 組合聊天紀錄文字
+                raw_text = "\n".join([f"- {m}" for m in messages])
 
+                # --- 整合您指定的 Prompt 格式 ---
+                summary_prompt = f"""
+你是一個會議與聊天摘要專家，請幫我整理昨日聊天內容，輸出格式必須如下（保持繁體中文，條列式）：
+
+昨日聊天摘要 ({date_str})
+群組聊天記錄摘要
+
+1. 關鍵決策：
+   - 請列出昨天討論中做出的決策或結論，如果沒有則寫「無」。
+2. 待辦事項：
+   - 請整理昨天分派的任務或工作，如果沒有則寫「無」。
+3. 未決問題：
+   - 請列出還沒有結論、需要後續討論的議題，如果沒有則寫「無」。
+4. 其他資訊：
+   - 其他有用的資訊或重點，如果沒有則寫「無」。
+
+---
+以下是聊天記錄原文：
+{raw_text}
+"""
+
+                # 5. 呼叫 OpenAI 產生摘要
+                logger.info(f"正在為 Chat {chat_id} 產生摘要 ({len(messages)}則訊息)...")
                 chat_completion = await aclient.chat.completions.create(
                     messages=[{"role": "user", "content": summary_prompt}],
-                    model="gpt-4o-mini",
+                    model="gpt-4o-mini", # 您也可以考慮使用 gpt-4-turbo 來獲得更好的長文本理解能力
                     temperature=0.2,
                     timeout=180,
                 )
                 summary_text = chat_completion.choices[0].message.content.strip()
 
-                # 5. 將摘要發送到對應的聊天室
+                # 6. 將摘要發送到對應的聊天室
                 await lark_client.send_message(http_client, chat_id, summary_text)
                 logger.info(f"成功發送 Chat {chat_id} 的每日摘要。")
 
