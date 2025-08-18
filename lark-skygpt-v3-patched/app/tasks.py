@@ -1,75 +1,81 @@
-import re
-from typing import List
-from sqlalchemy.ext.asyncio import AsyncSession
-from .database import AsyncSessionFactory
-from . import utils, lark_client, crud, openai_client
+# app/tasks.py
+
+import logging
 import httpx
+from datetime import datetime, timedelta
+from . import crud, utils, openai_client, lark_client
 
-SUMMARY_PROMPT = """你是資深會議/群組助理。請將下列聊天訊息整理成摘要（繁體中文）：
-輸出格式：
-(YYYY-MM-DD):
-### 群組聊天記錄摘要
+logger = logging.getLogger(__name__)
 
-#### 關鍵決策
-- ...
-
-#### 待辦事項
-- ...
-
-#### 未決問題
-- ...
-僅總結「昨天（本地時區）」00:00–24:00 的內容，簡潔具體。"""
-
-def _yesterday_title() -> str:
-    y = utils.now_local().date() - __import__('datetime').timedelta(days=1)
-    return f"({y.isoformat()}):"
 
 async def summarize_for_single_chat(http: httpx.AsyncClient, chat_id: str):
-    start_dt, end_dt = utils.yesterday_range_local()
-    start_ms, end_ms = utils.to_epoch_ms(start_dt), utils.to_epoch_ms(end_dt)
-    date_tag = start_dt.date().isoformat()
+    """
+    從資料庫拉取昨天的聊天記錄，交給 OpenAI 產生摘要，並送回群組。
+    """
 
-    async with AsyncSessionFactory() as db:
-        if not await crud.acquire_summary_lock(db, date_tag, chat_id):
-            return
+    # 1) 抓昨天的訊息
+    today = utils.now_local().date()
+    yesterday = today - timedelta(days=1)
+    start = datetime.combine(yesterday, datetime.min.time())
+    end = datetime.combine(yesterday, datetime.max.time())
+    msgs = await crud.get_messages_between(chat_id, start, end)
 
-    try:
-        items = await lark_client.list_chat_messages_between(http, chat_id, start_ms, end_ms)
-    except Exception:
-        items = []
-
-    snippets: List[str] = []
-    for it in items:
-        msg = it.get("message") or it
-        msg_type = msg.get("message_type")
-        if msg_type == "text":
-            try:
-                content = __import__('json').loads(msg.get("content") or "{}")
-            except Exception:
-                content = {}
-            t = (content.get("text") or "").strip()
-            if t:
-                clean = re.sub(r"<.*?>", "", t)[:300]
-                if clean:
-                    snippets.append(clean)
-
-    if not snippets:
-        await lark_client.send_text_to_chat(http, chat_id, f"{_yesterday_title()}\n（昨天沒有可摘要的文字訊息）")
+    if not msgs:
+        await lark_client.send_text_to_chat(http, chat_id, f"昨日（{yesterday}）沒有聊天記錄。")
         return
 
-    prompt = f"{SUMMARY_PROMPT}\n\n---\n聊天摘錄：\n" + "\n".join(f"- {s}" for s in snippets)
-    summary = await openai_client.text_completion(prompt)
+    # 2) 拼接聊天記錄
+    text = "\n".join([f"{m['text']}" for m in msgs if m.get("text")])
+
+    # 3) Prompt 固定格式
+    prompt = f"""
+你是一個會議與聊天摘要專家，請幫我整理昨日聊天內容，輸出格式必須如下（保持中文，條列式）：
+
+昨日聊天摘要 ({yesterday}):
+ 群組聊天記錄摘要
+
+1. 關鍵決策：
+   - 請列出昨天討論中做出的決策或結論
+2. 待辦事項：
+   - 請整理昨天分派的任務或工作
+3. 未決問題：
+   - 請列出還沒有結論、需要後續討論的議題
+4. 其他資訊：
+   - 其他有用的資訊或重點
+
+以下是聊天記錄：
+{text}
+"""
+
+    # 4) 丟給 OpenAI
+    summary = await openai_client.summarize_text_or_fallback(http, prompt)
+
+    # 5) 發回群組
     await lark_client.send_text_to_chat(http, chat_id, summary)
 
-async def run_daily_summary_per_chat():
-    # 列出昨天有聊天的 chat_id，逐一發送
-    start_dt, end_dt = utils.yesterday_range_local()
-    start_ms, end_ms = utils.to_epoch_ms(start_dt), utils.to_epoch_ms(end_dt)
-    async with AsyncSessionFactory() as db:
-        chat_ids = await crud.get_chat_ids_with_messages_between(db, start_ms, end_ms)
-    async with httpx.AsyncClient(timeout=30.0) as http:
-        for cid in chat_ids:
-            try:
-                await summarize_for_single_chat(http, cid)
-            except Exception:
-                pass
+
+async def summarize_for_all_chats(http: httpx.AsyncClient):
+    """
+    對所有群組執行昨日摘要。
+    """
+    chats = await crud.get_all_chats()
+    for chat in chats:
+        try:
+            await summarize_for_single_chat(http, chat["chat_id"])
+        except Exception as e:
+            logger.error(f"摘要失敗 chat={chat['chat_id']} error={e}")
+
+
+async def record_message(event: dict):
+    """
+    儲存聊天訊息到資料庫。
+    """
+    try:
+        chat_id = event["message"]["chat_id"]
+        text = event["message"]["content"]["text"]
+        sender = event["sender"]["sender_id"]["open_id"]
+        timestamp = datetime.fromtimestamp(event["message"]["create_time"] / 1000.0)
+
+        await crud.save_message(chat_id, sender, text, timestamp)
+    except Exception as e:
+        logger.error(f"記錄訊息失敗: {e}")
