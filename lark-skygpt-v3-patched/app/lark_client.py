@@ -138,4 +138,3 @@ async def get_message_resource(
     except Exception as e:
         logger.exception(f"下載資源 {file_key} 失敗: {e}")
         return None, None, None
-
