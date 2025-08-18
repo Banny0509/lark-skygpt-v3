@@ -1,10 +1,15 @@
+# app/crud.py
 from typing import Dict, Any, List
 from sqlalchemy import select, distinct
 from sqlalchemy.ext.asyncio import AsyncSession
 from .database import Message, SummaryLock
 
 async def insert_message(db: AsyncSession, row: Dict[str, Any]):
-    m = Message(**row)
+    # 白名單：只保留模型真的有的欄位，避免 TypeError
+    allowed = {c.name for c in Message.__table__.columns}
+    safe = {k: v for k, v in row.items() if k in allowed}
+
+    m = Message(**safe)
     db.add(m)
     try:
         await db.commit()
