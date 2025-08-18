@@ -14,11 +14,8 @@ from .config import settings
 from .database import init_db, AsyncSessionFactory
 from . import crud, lark_client, openai_client, utils, tasks
 
-# -----------------------------
-# 行為開關（群聊是否所有文字都回覆）
-# 在 Railway Variables 可設 RESPOND_ALL_GROUP_TEXT=true/false
-# 我這裡預設 True 以符合你的需求「除了 /help 以外全部走 OpenAI」
-# -----------------------------
+# 群聊是否所有文字都回覆（不必 @ 機器人）
+# Railway 變數：RESPOND_ALL_GROUP_TEXT=true/false
 RESPOND_ALL_GROUP_TEXT = (os.getenv("RESPOND_ALL_GROUP_TEXT", "true").lower() == "true")
 
 logging.basicConfig(
@@ -27,9 +24,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("skygpt-web")
 
-# -----------------------------
-# 應用生命週期
-# -----------------------------
 shared_state: Dict[str, Any] = {}
 
 @asynccontextmanager
@@ -91,7 +85,7 @@ async def lark_event(request: Request, db: AsyncSession = Depends(lambda: AsyncS
     if not (etype and "message" in etype):
         return JSONResponse({"code": 0})
 
-    # 2) 解析訊息基礎資訊
+    # 2) 解析訊息
     msg = event.get("message") or {}
     meta = _parse_msg_basic(msg)
     chat_id = meta["chat_id"]
@@ -101,7 +95,7 @@ async def lark_event(request: Request, db: AsyncSession = Depends(lambda: AsyncS
     content = meta["content"]
     create_ms = meta["create_ms"]
 
-    # 3) 儲存到 DB（best-effort）
+    # 3) 落庫（best-effort）
     try:
         await crud.insert_message(db, {
             "chat_id": chat_id,
@@ -125,7 +119,7 @@ async def lark_event(request: Request, db: AsyncSession = Depends(lambda: AsyncS
             if not text:
                 return JSONResponse({"code": 0})
 
-            # /help：列出指令
+            # 指令
             if text.startswith("/help"):
                 await lark_client.send_text_to_chat(http, chat_id,
                     "指令：\n"
@@ -136,7 +130,6 @@ async def lark_event(request: Request, db: AsyncSession = Depends(lambda: AsyncS
                 )
                 return JSONResponse({"code": 0})
 
-            # 其餘全部走 OpenAI（但你也要能用 /time /date /summary）
             if text.startswith("/time"):
                 await lark_client.send_text_to_chat(
                     http, chat_id, utils.now_local().strftime("現在時間：%Y-%m-%d %H:%M:%S %Z")
@@ -150,6 +143,7 @@ async def lark_event(request: Request, db: AsyncSession = Depends(lambda: AsyncS
                 return JSONResponse({"code": 0})
 
             if text.startswith("/summary"):
+                # 使用新版 tasks.py：固定格式（關鍵決策/待辦事項/未決問題/其他資訊）
                 try:
                     await tasks.summarize_for_single_chat(http, chat_id)
                 except Exception as e:
@@ -158,14 +152,13 @@ async def lark_event(request: Request, db: AsyncSession = Depends(lambda: AsyncS
                 return JSONResponse({"code": 0})
 
             # ---- 群聊門檻控制 ----
-            proceed = True
             if chat_type == "group" and not RESPOND_ALL_GROUP_TEXT:
-                # 安靜模式下，僅在被 @ 時回覆
+                # 安靜模式：僅在被 @ 時回覆
                 if not _is_bot_mentioned(msg, settings.BOT_NAME):
                     return JSONResponse({"code": 0})
                 text = _strip_bot_mention(text, settings.BOT_NAME)
 
-            # ---- 丟給 OpenAI ----
+            # ---- 其餘全部走 OpenAI ----
             reply = await openai_client.reply_text_or_fallback(http, text)
             await lark_client.send_text_to_chat(http, chat_id, reply)
             return JSONResponse({"code": 0})
@@ -195,8 +188,9 @@ async def lark_event(request: Request, db: AsyncSession = Depends(lambda: AsyncS
 
     return JSONResponse({"code": 0})
 
+
 # -----------------------------
-# 小工具
+# 工具函式
 # -----------------------------
 def _parse_msg_basic(msg: Dict[str, Any]) -> Dict[str, Any]:
     chat_id = msg.get("chat_id")
@@ -221,6 +215,10 @@ def _parse_msg_basic(msg: Dict[str, Any]) -> Dict[str, Any]:
         file_key = msg.get("file_key") or (content.get("file_key") if isinstance(content, dict) else None)
         file_name = msg.get("file_name") or (content.get("file_name") if isinstance(content, dict) else None)
         content = {"file_key": file_key, "file_name": file_name}
+    else:
+        # text 或 其他：確保有 text 欄位
+        if isinstance(content, dict) and "text" not in content:
+            content["text"] = content.get("text") or ""
 
     return {
         "chat_id": chat_id,
