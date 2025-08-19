@@ -99,7 +99,7 @@ async def summarize_text_or_fallback(http: httpx.AsyncClient, text: str) -> str:
         return f"(降級摘要)\n{bullets}" if bullets else "(降級摘要) 無可摘要內容"
 
 # =========================
-# Lark 端：租戶令牌 & 「訊息資源」下載  ✅ 新增：符合 Lark 最新規範
+# Lark 端：租戶令牌 & 「訊息資源」下載（符合官方規範）
 # =========================
 LARK_TENANT_TOKEN_URL = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
 # 依官方文件：從訊息中取資源必須帶 message_id 與 file_key，並指定 type=image|file
@@ -127,7 +127,7 @@ async def _download_message_resource(
     rtype: str,  # "image" 或 "file"
 ) -> bytes:
     """
-    ✅ 依 Lark 官方規範：從訊息中下載資源（二進位），支援 image / file。
+    依 Lark 官方規範：從訊息中下載資源（二進位），支援 image / file。
     需匹配的條件：
       - 應用擁有權限（im:files:read / im:message / im:message:send）
       - 應用已加入該訊息所在的會話
@@ -153,7 +153,7 @@ async def _download_message_resource(
     return r.content
 
 # =========================
-# 圖片 → Vision（多模態）✅ 改為使用「訊息資源」端點
+# 圖片 → Vision（多模態）：使用「訊息資源」端點
 # =========================
 async def describe_image_from_message_or_fallback(
     http: httpx.AsyncClient, message_id: str, image_key: str
@@ -205,7 +205,7 @@ async def describe_image_from_message_or_fallback(
         return f"(降級) 圖像理解暫不可用：{e}"
 
 # =========================
-# PDF → 圖片（首頁）→ Vision（多模態）✅ 使用「訊息資源：type=file」
+# PDF → 圖片（首頁）→ Vision（多模態）：使用「訊息資源：type=file」
 # =========================
 async def describe_pdf_from_message_or_fallback(
     http: httpx.AsyncClient, message_id: str, file_key: str
@@ -232,7 +232,7 @@ async def describe_pdf_from_message_or_fallback(
         if doc.page_count == 0:
             return "(降級) PDF 內容為空，無法解析。"
         page = doc.load_page(0)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 放大解析度，提高清晰度
         img_bytes = pix.tobytes("png")
     except Exception as e:
         logger.exception("PDF 轉圖失敗：%s", e)
@@ -264,8 +264,9 @@ async def describe_pdf_from_message_or_fallback(
             txt = (await resp.aread()).decode(errors="ignore")
             logger.error("OpenAI Vision (PDF) error %s: %s", resp.status_code, txt)
             return f"(降級) PDF 圖像理解調用失敗（{resp.status_code}）：{txt[:200]}"
-        data = resp.json()
-        return (data["choices"][0]["message"]["content"] or "").strip()
     except Exception as e:
         logger.exception("Vision (PDF) 調用異常：%s", e)
         return f"(降級) PDF 圖像理解暫不可用：{e}"
+
+    data = resp.json()
+    return (data["choices"][0]["message"]["content"] or "").strip()
