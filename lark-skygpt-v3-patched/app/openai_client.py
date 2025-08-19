@@ -271,3 +271,145 @@ async def describe_pdf_from_message_or_fallback(
 
     data = resp.json()
     return (data["choices"][0]["message"]["content"] or "").strip()
+
+# ==== COMPAT PATCH (append-only) for lark_client.py ====
+# 不覆蓋你原本的方法；若缺少才補上。避免 Worker 報
+# "module 'app.lark_client' has no attribute 'get_tenant_access_token'"
+
+import os as _os
+import json as _json
+import logging as _logging
+from typing import Optional as _Optional
+
+try:
+    import httpx as _httpx
+except Exception as _e:  # pragma: no cover
+    raise RuntimeError("lark_client 需要 httpx，請確認 requirements 已安裝 httpx") from _e
+
+try:
+    from .config import settings as _settings
+except Exception as _e:  # pragma: no cover
+    raise
+
+_logger = _logging.getLogger(__name__)
+
+_LARK_TENANT_TOKEN_URL = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
+_LARK_SEND_MESSAGE_URL = "https://open.larksuite.com/open-apis/im/v1/messages"
+
+# 簡易快取，避免每次都打 token 端點
+__LARK_TOKEN_CACHE = {"token": None, "expires_at": 0}
+try:
+    import time as _time
+except Exception:  # pragma: no cover
+    pass
+
+def _resolve_lark_credentials() -> tuple[str, str]:
+    # 依序嘗試 settings 與環境變數的多種命名
+    app_id = (
+        getattr(_settings, "LARK_APP_ID", None)
+        or getattr(_settings, "FEISHU_APP_ID", None)
+        or getattr(_settings, "APP_ID", None)
+        or _os.getenv("LARK_APP_ID")
+        or _os.getenv("FEISHU_APP_ID")
+        or _os.getenv("APP_ID")
+    )
+    app_secret = (
+        getattr(_settings, "LARK_APP_SECRET", None)
+        or getattr(_settings, "FEISHU_APP_SECRET", None)
+        or getattr(_settings, "APP_SECRET", None)
+        or _os.getenv("LARK_APP_SECRET")
+        or _os.getenv("FEISHU_APP_SECRET")
+        or _os.getenv("APP_SECRET")
+    )
+    if not app_id or not app_secret:
+        raise RuntimeError(
+            "找不到 Lark 應用憑證，請設定 LARK_APP_ID/LARK_APP_SECRET "
+            "（或 FEISHU_*、APP_*）於 settings 或環境變數。"
+        )
+    return app_id, app_secret
+
+
+async def _issue_tenant_access_token(_http: _httpx.AsyncClient) -> str:
+    app_id, app_secret = _resolve_lark_credentials()
+    resp = await _http.post(
+        _LARK_TENANT_TOKEN_URL,
+        json={"app_id": app_id, "app_secret": app_secret},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    tok = data.get("tenant_access_token")
+    expire = data.get("expire", 0)  # 秒
+    if not tok:
+        raise RuntimeError(f"取得 tenant_access_token 失敗：{data}")
+    # 設定快取：提早 60 秒失效
+    now = int(_time.time())
+    __LARK_TOKEN_CACHE["token"] = tok
+    __LARK_TOKEN_CACHE["expires_at"] = now + int(expire or 3600) - 60
+    return tok
+
+
+# ---- 1) get_tenant_access_token（只有缺少時才補上） ----
+if "get_tenant_access_token" not in globals():
+
+    async def get_tenant_access_token(http: _httpx.AsyncClient) -> str:
+        """
+        相容 Worker / tasks 所需的 API：取得 Lark tenant_access_token。
+        具簡單快取；若快取過期會自動重取。
+        """
+        try:
+            now = int(_time.time())
+            tok = __LARK_TOKEN_CACHE.get("token")
+            exp = __LARK_TOKEN_CACHE.get("expires_at", 0)
+            if tok and now < exp:
+                return tok
+        except Exception:
+            pass
+        try:
+            return await _issue_tenant_access_token(http)
+        except Exception as e:
+            _logger.exception("取得 tenant_access_token 失敗：%s", e)
+            raise
+
+# ---- 2) send_text（常見專案會直接呼叫；只有缺少時才補上） ----
+if "send_text" not in globals():
+
+    async def send_text(http: _httpx.AsyncClient, chat_id: str, text: str, *, by_chat_id: bool = True) -> None:
+        """
+        在群組/單聊發送純文字訊息。失敗僅記錄，不拋錯，避免中斷排程或 webhook。
+        """
+        try:
+            token = await get_tenant_access_token(http)
+        except Exception as e:
+            _logger.error("無法發送訊息，取得 token 失敗：%s", e)
+            return
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        params = {"receive_id_type": "chat_id" if by_chat_id else "open_id"}
+        body = {
+            "receive_id": chat_id,
+            "msg_type": "text",
+            "content": _json.dumps({"text": text}, ensure_ascii=False),
+        }
+        try:
+            resp = await http.post(_LARK_SEND_MESSAGE_URL, headers=headers, params=params, json=body, timeout=20)
+            if resp.status_code >= 400:
+                try:
+                    errtxt = (await resp.aread()).decode(errors="ignore")
+                except Exception:
+                    errtxt = "<body read error>"
+                _logger.error("Lark send_text 失敗 %s: %s", resp.status_code, errtxt)
+        except Exception as e:
+            _logger.exception("Lark send_text 發送異常：%s", e)
+
+# ---- 3) reply_text（舊程式相容；只有缺少時才補上） ----
+if "reply_text" not in globals():
+
+    async def reply_text(http: _httpx.AsyncClient, chat_id: str, text: str, by_chat_id: bool = True) -> None:
+        """相容舊接口；等價於 send_text。"""
+        await send_text(http, chat_id, text, by_chat_id=by_chat_id)
+
+# ==== END COMPAT PATCH ====
