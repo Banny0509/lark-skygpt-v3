@@ -208,3 +208,21 @@ async def lark_webhook(request: Request):
         # 其他訊息型別：尚未支援
         await reply_text(http, chat_id, f"收到類型 {msg_type}，暫未支援。", by_chat_id=True)
         return PlainTextResponse("ok")
+# === Route aliases for Lark (fix 404 on /webhook/lark) ===
+from fastapi import Request
+from fastapi.responses import PlainTextResponse
+
+@app.post("/webhook/lark")
+async def lark_webhook_alias(request: Request):
+    # 轉呼叫原本的處理器（/lark/webhook）
+    return await lark_webhook(request)
+
+# 可選：提供更直覺的健康檢查路徑，避免平台檢測 404
+@app.get("/")
+async def root_ok():
+    return {"ok": True, "service": "web", "env": getattr(settings, "ENV", "prod")}
+
+@app.get("/health")
+async def health_alias():
+    return await healthz()
+
