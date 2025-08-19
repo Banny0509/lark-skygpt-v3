@@ -3,9 +3,38 @@ import os
 import json
 import logging
 from typing import Optional
-
 import httpx
 from .config import settings
+# --- Lark 文件下载（避免 403 的关键） ---
+LARK_TENANT_TOKEN_URL = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
+LARK_FILE_DOWNLOAD_TPL = "https://open.larksuite.com/open-apis/im/v1/files/{file_key}/download"
+
+async def _get_tenant_access_token(http: httpx.AsyncClient) -> str:
+    """获取 Lark 租户访问令牌（内部应用）。"""
+    if not (settings.LARK_APP_ID and settings.LARK_APP_SECRET):
+        raise RuntimeError("LARK_APP_ID / LARK_APP_SECRET 未配置，无法下载图片")
+    r = await http.post(
+        LARK_TENANT_TOKEN_URL,
+        json={"app_id": settings.LARK_APP_ID, "app_secret": settings.LARK_APP_SECRET},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    tok = data.get("tenant_access_token")
+    if not tok:
+        raise RuntimeError(f"获取 tenant_access_token 失败：{data}")
+    return tok
+
+async def _download_lark_image_bytes(http: httpx.AsyncClient, image_key: str) -> bytes:
+    """用租户令牌从 Lark 下载图片二进制。"""
+    token = await _get_tenant_access_token(http)
+    url = LARK_FILE_DOWNLOAD_TPL.format(file_key=image_key)
+    r = await http.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    if r.status_code == 403:
+        # 经典 403：权限未勾 `im:files:read` 或应用未加入群
+        raise PermissionError("Lark 403：请确认勾选 im:files:read，并将应用加入目标群后发布生效")
+    r.raise_for_status()
+    return r.content
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +141,58 @@ async def summarize_text_or_fallback(http: httpx.AsyncClient, text: str) -> str:
 
 async def describe_image_or_fallback(http: httpx.AsyncClient, image_key: str) -> str:
     """
-    圖片描述：目前預設穩定降級（若你已有圖片可公開訪問的 URL，我可幫你接 Vision）。
+    图像理解：最小侵入启用 OpenAI Vision。
+    - 先用 Lark 官方下载接口拿到图片 bytes（带 tenant_access_token）
+    - 转 base64 data URL 作为 image_url
+    - 走 Chat Completions 多模态（gpt-4o-mini 默认支持）
+    - 若权限/网络异常，返回可读降级提示，不让服务崩溃
     """
-    # 若你已在 lark_client 實作取得圖片 URL，可把 URL 傳進來，然後改走 Vision：
-    #   1) 將 messages 改為帶 image_url 的多模態內容
-    #   2) 模型可用 gpt-4o-mini / gpt-4o
-    #
-    # 先提供穩定降級，以免阻塞流程
-    return f"我收到了圖片（image_key={image_key}）。目前未啟用圖像解析，如需圖像理解請提供文字描述，或告知我可存取的圖片 URL。"
+    # 无 Key 直接降级（保持你原来的策略）
+    if not (settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.strip()):
+        return f"(降级) 收到图片 image_key={image_key}，但未配置 OPENAI_API_KEY。"
+
+    try:
+        img_bytes = await _download_lark_image_bytes(http, image_key)
+    except PermissionError as e:
+        # 明确提示 403 场景与该做什么
+        return f"(降级) 图像理解权限不足：{e}"
+    except Exception as e:
+        logger.exception("下载图片失败：%s", e)
+        return f"(降级) 无法下载图片（image_key={image_key)）：{e}"
+
+    import base64
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{b64}"
+
+    headers = {
+        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": DEFAULT_MODEL,  # 默认 gpt-4o-mini；可用 OPENAI_MODEL 覆盖
+        "temperature": 0.3,
+        "max_tokens": 800,
+        "messages": [
+            {"role": "system", "content": "你是中文图像理解助手，请用简体中文、条列方式给出要点摘要；表格请概括关键字段。"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请阅读这张图片，提取主要信息与可读文字，并条列重点结论。"},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+    }
+
+    try:
+        resp = await http.post(OPENAI_API_URL, headers=headers, json=payload, timeout=90)
+        if resp.status_code >= 400:
+            txt = (await resp.aread()).decode(errors="ignore")
+            logger.error("OpenAI Vision error %s: %s", resp.status_code, txt)
+            return f"(降级) 图像理解权限不足（{resp.status_code}）：{txt[:200]}"
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.exception("Vision 调用异常：%s", e)
+        return f"(降级) 图像理解权限不足：{e}"
+
