@@ -102,15 +102,41 @@ async def summarize_text_or_fallback(http: httpx.AsyncClient, text: str) -> str:
 # Lark：租戶令牌 & 「訊息資源」下載（符合官方規範）
 # =========================
 LARK_TENANT_TOKEN_URL = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
-# 從訊息中取資源必須帶 message_id 與 file_key，並指定 type=image|file
 LARK_MSG_RESOURCE_TPL = "https://open.larksuite.com/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
 
+def _resolve_lark_credentials() -> tuple[str, str]:
+    """
+    兼容 settings 與環境變數多種命名：LARK_* / FEISHU_* / APP_*。
+    修復：避免 'Settings' object has no attribute 'LARK_APP_ID' 的 AttributeError。
+    """
+    app_id = (
+        getattr(settings, "LARK_APP_ID", None)
+        or getattr(settings, "FEISHU_APP_ID", None)
+        or getattr(settings, "APP_ID", None)
+        or os.getenv("LARK_APP_ID")
+        or os.getenv("FEISHU_APP_ID")
+        or os.getenv("APP_ID")
+    )
+    app_secret = (
+        getattr(settings, "LARK_APP_SECRET", None)
+        or getattr(settings, "FEISHU_APP_SECRET", None)
+        or getattr(settings, "APP_SECRET", None)
+        or os.getenv("LARK_APP_SECRET")
+        or os.getenv("FEISHU_APP_SECRET")
+        or os.getenv("APP_SECRET")
+    )
+    if not app_id or not app_secret:
+        raise RuntimeError(
+            "找不到 Lark 應用憑證：請在 settings 或環境變數設定 "
+            "LARK_APP_ID/LARK_APP_SECRET（或 FEISHU_* / APP_*）。"
+        )
+    return app_id, app_secret
+
 async def _get_tenant_access_token(http: httpx.AsyncClient) -> str:
-    if not (settings.LARK_APP_ID and settings.LARK_APP_SECRET):
-        raise RuntimeError("LARK_APP_ID / LARK_APP_SECRET 未配置，無法下載圖片/檔案")
+    app_id, app_secret = _resolve_lark_credentials()
     r = await http.post(
         LARK_TENANT_TOKEN_URL,
-        json={"app_id": settings.LARK_APP_ID, "app_secret": settings.LARK_APP_SECRET},
+        json={"app_id": app_id, "app_secret": app_secret},
         timeout=20,
     )
     r.raise_for_status()
@@ -126,13 +152,6 @@ async def _download_message_resource(
     file_key: str,
     rtype: str,  # "image" 或 "file"
 ) -> bytes:
-    """
-    依 Lark 官方規範：從訊息中下載資源（二進位），支援 image / file。
-    需匹配的條件：
-      - 應用擁有權限（im:files:read / im:message / im:message:send）
-      - 應用已加入該訊息所在的會話
-      - message_id 與 file_key 對應同一則訊息
-    """
     assert rtype in ("image", "file"), "rtype 需為 image 或 file"
     token = await _get_tenant_access_token(http)
     url = LARK_MSG_RESOURCE_TPL.format(message_id=message_id, file_key=file_key)
@@ -141,26 +160,21 @@ async def _download_message_resource(
         "Content-Type": "application/json; charset=utf-8",
     }
     r = await http.get(url, headers=headers, params={"type": rtype}, timeout=120)
-    # 常見錯誤碼對應（以官方文件為準）
     if r.status_code == 400:
-        # 234003: File not in message / 234004: App not in chat / 234037: 超上限
         logger.error("Lark 400: %s", await r.aread())
     if r.status_code == 401:
         logger.error("Lark 401 Unauthorized: %s", await r.aread())
     if r.status_code == 403:
-        logger.error("Lark 403 Forbidden (可能外部群或受限模式): %s", await r.aread())
+        logger.error("Lark 403 Forbidden: %s", await r.aread())
     r.raise_for_status()
     return r.content
 
 # =========================
-# 圖片 → Vision（多模態）：使用「訊息資源」端點
+# 圖片 → Vision（多模態）
 # =========================
 async def describe_image_from_message_or_fallback(
     http: httpx.AsyncClient, message_id: str, image_key: str
 ) -> str:
-    """
-    從訊息下載圖片（message_id + image_key + type=image）→ OpenAI Vision。
-    """
     if not (settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.strip()):
         return f"(降級) 收到圖片 image_key={image_key}，但未配置 OPENAI_API_KEY。"
 
@@ -170,7 +184,6 @@ async def describe_image_from_message_or_fallback(
         return f"(降級) 圖像下載失敗（{e.response.status_code}）：請確認應用權限與是否已加入該群，以及 message_id 與 file_key 是否匹配"
     except Exception as e:
         logger.exception("下載圖片失敗：%s", e)
-        # 這裡是你日志中曾出現的錯誤行，已修正為 {image_key}（不要有多餘的 )）
         return f"(降級) 無法下載圖片（image_key={image_key}）：{e}"
 
     b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -206,18 +219,14 @@ async def describe_image_from_message_or_fallback(
         return f"(降級) 圖像理解暫不可用：{e}"
 
 # =========================
-# PDF → 圖片（首頁）→ Vision（多模態）：使用「訊息資源：type=file」
+# PDF → 圖片（首頁）→ Vision（多模態）
 # =========================
 async def describe_pdf_from_message_or_fallback(
     http: httpx.AsyncClient, message_id: str, file_key: str
 ) -> str:
-    """
-    從訊息下載 PDF（message_id + file_key + type=file）→ 轉圖（首頁）→ OpenAI Vision。
-    """
     if not (settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.strip()):
         return f"(降級) 收到 PDF file_key={file_key}，但未配置 OPENAI_API_KEY。"
 
-    # 下載 PDF 二進位
     try:
         pdf_bytes = await _download_message_resource(http, message_id, file_key, rtype="file")
     except httpx.HTTPStatusError as e:
@@ -226,14 +235,13 @@ async def describe_pdf_from_message_or_fallback(
         logger.exception("下載 PDF 失敗：%s", e)
         return f"(降級) 下載 PDF 錯誤：{e}"
 
-    # 轉圖（PyMuPDF）
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         if doc.page_count == 0:
             return "(降級) PDF 內容為空，無法解析。"
         page = doc.load_page(0)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 放大解析度，提高清晰度
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         img_bytes = pix.tobytes("png")
     except Exception as e:
         logger.exception("PDF 轉圖失敗：%s", e)
@@ -272,144 +280,3 @@ async def describe_pdf_from_message_or_fallback(
     data = resp.json()
     return (data["choices"][0]["message"]["content"] or "").strip()
 
-# ==== COMPAT PATCH (append-only) for lark_client.py ====
-# 不覆蓋你原本的方法；若缺少才補上。避免 Worker 報
-# "module 'app.lark_client' has no attribute 'get_tenant_access_token'"
-
-import os as _os
-import json as _json
-import logging as _logging
-from typing import Optional as _Optional
-
-try:
-    import httpx as _httpx
-except Exception as _e:  # pragma: no cover
-    raise RuntimeError("lark_client 需要 httpx，請確認 requirements 已安裝 httpx") from _e
-
-try:
-    from .config import settings as _settings
-except Exception as _e:  # pragma: no cover
-    raise
-
-_logger = _logging.getLogger(__name__)
-
-_LARK_TENANT_TOKEN_URL = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
-_LARK_SEND_MESSAGE_URL = "https://open.larksuite.com/open-apis/im/v1/messages"
-
-# 簡易快取，避免每次都打 token 端點
-__LARK_TOKEN_CACHE = {"token": None, "expires_at": 0}
-try:
-    import time as _time
-except Exception:  # pragma: no cover
-    pass
-
-def _resolve_lark_credentials() -> tuple[str, str]:
-    # 依序嘗試 settings 與環境變數的多種命名
-    app_id = (
-        getattr(_settings, "LARK_APP_ID", None)
-        or getattr(_settings, "FEISHU_APP_ID", None)
-        or getattr(_settings, "APP_ID", None)
-        or _os.getenv("LARK_APP_ID")
-        or _os.getenv("FEISHU_APP_ID")
-        or _os.getenv("APP_ID")
-    )
-    app_secret = (
-        getattr(_settings, "LARK_APP_SECRET", None)
-        or getattr(_settings, "FEISHU_APP_SECRET", None)
-        or getattr(_settings, "APP_SECRET", None)
-        or _os.getenv("LARK_APP_SECRET")
-        or _os.getenv("FEISHU_APP_SECRET")
-        or _os.getenv("APP_SECRET")
-    )
-    if not app_id or not app_secret:
-        raise RuntimeError(
-            "找不到 Lark 應用憑證，請設定 LARK_APP_ID/LARK_APP_SECRET "
-            "（或 FEISHU_*、APP_*）於 settings 或環境變數。"
-        )
-    return app_id, app_secret
-
-
-async def _issue_tenant_access_token(_http: _httpx.AsyncClient) -> str:
-    app_id, app_secret = _resolve_lark_credentials()
-    resp = await _http.post(
-        _LARK_TENANT_TOKEN_URL,
-        json={"app_id": app_id, "app_secret": app_secret},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    tok = data.get("tenant_access_token")
-    expire = data.get("expire", 0)  # 秒
-    if not tok:
-        raise RuntimeError(f"取得 tenant_access_token 失敗：{data}")
-    # 設定快取：提早 60 秒失效
-    now = int(_time.time())
-    __LARK_TOKEN_CACHE["token"] = tok
-    __LARK_TOKEN_CACHE["expires_at"] = now + int(expire or 3600) - 60
-    return tok
-
-
-# ---- 1) get_tenant_access_token（只有缺少時才補上） ----
-if "get_tenant_access_token" not in globals():
-
-    async def get_tenant_access_token(http: _httpx.AsyncClient) -> str:
-        """
-        相容 Worker / tasks 所需的 API：取得 Lark tenant_access_token。
-        具簡單快取；若快取過期會自動重取。
-        """
-        try:
-            now = int(_time.time())
-            tok = __LARK_TOKEN_CACHE.get("token")
-            exp = __LARK_TOKEN_CACHE.get("expires_at", 0)
-            if tok and now < exp:
-                return tok
-        except Exception:
-            pass
-        try:
-            return await _issue_tenant_access_token(http)
-        except Exception as e:
-            _logger.exception("取得 tenant_access_token 失敗：%s", e)
-            raise
-
-# ---- 2) send_text（常見專案會直接呼叫；只有缺少時才補上） ----
-if "send_text" not in globals():
-
-    async def send_text(http: _httpx.AsyncClient, chat_id: str, text: str, *, by_chat_id: bool = True) -> None:
-        """
-        在群組/單聊發送純文字訊息。失敗僅記錄，不拋錯，避免中斷排程或 webhook。
-        """
-        try:
-            token = await get_tenant_access_token(http)
-        except Exception as e:
-            _logger.error("無法發送訊息，取得 token 失敗：%s", e)
-            return
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
-        }
-        params = {"receive_id_type": "chat_id" if by_chat_id else "open_id"}
-        body = {
-            "receive_id": chat_id,
-            "msg_type": "text",
-            "content": _json.dumps({"text": text}, ensure_ascii=False),
-        }
-        try:
-            resp = await http.post(_LARK_SEND_MESSAGE_URL, headers=headers, params=params, json=body, timeout=20)
-            if resp.status_code >= 400:
-                try:
-                    errtxt = (await resp.aread()).decode(errors="ignore")
-                except Exception:
-                    errtxt = "<body read error>"
-                _logger.error("Lark send_text 失敗 %s: %s", resp.status_code, errtxt)
-        except Exception as e:
-            _logger.exception("Lark send_text 發送異常：%s", e)
-
-# ---- 3) reply_text（舊程式相容；只有缺少時才補上） ----
-if "reply_text" not in globals():
-
-    async def reply_text(http: _httpx.AsyncClient, chat_id: str, text: str, by_chat_id: bool = True) -> None:
-        """相容舊接口；等價於 send_text。"""
-        await send_text(http, chat_id, text, by_chat_id=by_chat_id)
-
-# ==== END COMPAT PATCH ====
