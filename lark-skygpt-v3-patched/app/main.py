@@ -16,8 +16,9 @@ from .openai_client import (
     summarize_text_or_fallback,
     describe_image_from_message_or_fallback,
     describe_pdf_from_message_or_fallback,
-    _download_message_resource,  # 直接複用下載資源
+    _download_message_resource,  # 你原本的下載資源工具，保留使用
 )
+from . import tasks  # 用來記錄訊息到 DB（供每日摘要用）
 
 logger = logging.getLogger("sky_lark")
 logging.basicConfig(level=logging.INFO)
@@ -151,6 +152,42 @@ async def _dedupe_mark(message_id: str) -> bool:
     return True
 
 # =========================
+# 群組必須 @ 機器人 才會回覆（文字/圖片/檔案）
+# =========================
+def _is_p2p_chat(msg: dict) -> bool:
+    chat_type = (msg.get("chat_type") or "").lower()
+    return chat_type in ("p2p", "single", "private", "p2p_chat")
+
+def _bot_is_mentioned(msg: dict, content_text: str) -> bool:
+    # 1) mentions 陣列（Lark 事件）內含 bot
+    mentions = msg.get("mentions") or []
+    app_id = (
+        getattr(settings, "LARK_APP_ID", None)
+        or getattr(settings, "FEISHU_APP_ID", None)
+        or getattr(settings, "APP_ID", None)
+        or os.getenv("LARK_APP_ID")
+        or os.getenv("FEISHU_APP_ID")
+        or os.getenv("APP_ID")
+        or ""
+    ).lower()
+    for m in mentions:
+        mid = (m.get("id") or "").lower()
+        if app_id and app_id in mid:
+            return True
+    # 2) 文字中含 <at ...> 片段（富文字 @）
+    text = content_text or ""
+    if "<at" in text:
+        return True
+    # 3) 後備：環境變數指定名稱（如 @小幫手）
+    bot_name = os.getenv("BOT_NAME") or ""
+    if bot_name and f"@{bot_name}" in text:
+        return True
+    # 4) 再後備：固定提示字
+    if "@bot" in text:
+        return True
+    return False
+
+# =========================
 # Lark Webhook（固定：/webhook/lark）
 #   * 立即回 200，避免 499
 #   * 背景任務處理（不阻塞）
@@ -177,6 +214,8 @@ async def lark_webhook_alias(request: Request):
 
 # -------------------------
 # 背景處理：實際 AI 路徑（文字 / 圖片 / PDF / DOCX / XLSX）
+# 需求：群組必須「@機器人」才處理（檔案也需要）；私聊照舊。
+# 並且把訊息記錄到 DB（供每日摘要用）。
 # -------------------------
 async def _process_lark_event(event: Dict[str, Any]) -> None:
     header = event.get("header", {}) or {}
@@ -189,6 +228,12 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
     message_id = msg.get("message_id")
     chat_id = msg.get("chat_id")
     content_raw = msg.get("content", "{}")
+
+    # 將事件先寫入 DB（不阻塞主流程）
+    try:
+        asyncio.create_task(tasks.record_message(event))
+    except Exception as _e:
+        logger.debug("record_message fire-and-forget 失敗：%s", _e)
 
     try:
         content = json.loads(content_raw) if isinstance(content_raw, str) else (content_raw or {})
@@ -204,10 +249,17 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
         if not first:
             return
 
+    # 判斷是否需要 @
+    text_in = (content.get("text") or "") if isinstance(content, dict) else ""
+    require_mention = not _is_p2p_chat(msg)
+    mentioned = _bot_is_mentioned(msg, text_in)
+
     async with httpx.AsyncClient() as http:
         # 文字
         if msg_type == "text":
-            text = (content.get("text") or "").strip()
+            if require_mention and not mentioned:
+                return
+            text = (text_in or "").strip()
             if not text:
                 return
             try:
@@ -223,6 +275,8 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
 
         # 圖片
         if msg_type == "image":
+            if require_mention and not mentioned:
+                return
             image_key = content.get("image_key")
             if not (message_id and image_key):
                 await reply_text(http, chat_id, "(降級) 未取得訊息 ID 或圖片 key，無法解析圖片。", by_chat_id=True)
@@ -237,6 +291,8 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
 
         # 檔案（PDF / DOCX / XLSX）
         if msg_type == "file":
+            if require_mention and not mentioned:
+                return
             file_key = content.get("file_key")
             file_name = (content.get("file_name") or "").lower()
             if not (message_id and file_key):
@@ -337,5 +393,3 @@ async def _extract_docx_text_and_summarize(data: bytes, http: httpx.AsyncClient)
 async def _extract_xlsx_text_and_summarize(data: bytes, http: httpx.AsyncClient) -> str:
     text = _extract_xlsx_text(data)
     return await summarize_text_or_fallback(http, text)
-
-
