@@ -1,47 +1,70 @@
-# app/tasks.py
-
-import logging
+import os
 import json
+import logging
 import httpx
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
-from . import crud, utils, openai_client, lark_client
+from . import openai_client
+
+# 有就用，沒有就降級（不中斷）
+try:
+    from . import crud  # noqa
+    _HAS_CRUD = True
+except Exception:
+    crud = None  # type: ignore
+    _HAS_CRUD = False
+
+try:
+    from . import lark_client  # noqa
+    _HAS_LARK = True
+except Exception:
+    lark_client = None  # type: ignore
+    _HAS_LARK = False
 
 logger = logging.getLogger(__name__)
-TZ = ZoneInfo("Asia/Taipei")
+TZ = ZoneInfo(os.getenv("TZ", "Asia/Taipei"))
 
 def _yesterday_range() -> tuple[datetime, datetime]:
-    """
-    取得『昨天 00:00』到『今天 00:00』（end 為「不含」），避免跨天重疊。
-    """
-    now = utils.now_local() if hasattr(utils, "now_local") else datetime.now(TZ)
-    today = now.astimezone(TZ).date()
+    now = datetime.now(TZ)
+    today = now.date()
     y = today - timedelta(days=1)
-    start = datetime.combine(y, dt_time.min, tzinfo=TZ)
-    end = datetime.combine(today, dt_time.min, tzinfo=TZ)  # 今天 00:00 (exclusive)
+    start = datetime.combine(y, dt_time.min, tzinfo=TZ)       # 昨日 00:00（含）
+    end   = datetime.combine(today, dt_time.min, tzinfo=TZ)    # 今日 00:00（不含）
     return start, end
 
+def _summary_chat_ids() -> list[str]:
+    """若 DB 無 get_all_chats，則用環境變數 SUMMARY_CHAT_IDS=oc_xxx,oc_yyy"""
+    ids_env = os.getenv("SUMMARY_CHAT_IDS", "")
+    return [i.strip() for i in ids_env.split(",") if i.strip()]
+
+async def _send_text(http: httpx.AsyncClient, chat_id: str, text: str):
+    if _HAS_LARK and hasattr(lark_client, "send_text_to_chat"):
+        await lark_client.send_text_to_chat(http, chat_id, text)
+        return
+    if hasattr(openai_client, "reply_text"):
+        await openai_client.reply_text(http, chat_id, text, by_chat_id=True)  # type: ignore
+
 async def summarize_for_single_chat(http: httpx.AsyncClient, chat_id: str):
-    """
-    從資料庫拉取『昨天 00:00–24:00』聊天記錄，交給 OpenAI 產生摘要，並送回群組。
-    """
     start, end = _yesterday_range()
-    msgs = await crud.get_messages_between(chat_id, start, end)
+
+    msgs = []
+    if _HAS_CRUD and hasattr(crud, "get_messages_between"):
+        try:
+            msgs = await crud.get_messages_between(chat_id, start, end)  # type: ignore
+        except Exception as e:
+            logger.error("讀取訊息失敗：%s", e)
 
     if not msgs:
-        await lark_client.send_text_to_chat(http, chat_id, f"昨日（{start.date()}）沒有聊天記錄。")
+        await _send_text(http, chat_id, f"昨日（{start.date()}）沒有聊天記錄。")
         return
 
-    # 把純文字訊息串接（保留你原有格式）
-    text = "\n".join([f"{m['text']}" for m in msgs if m.get("text")])
-
+    text = "\n".join([f"{m['text']}" for m in msgs if isinstance(m, dict) and m.get("text")])
     prompt = f"""
 你是一個會議與聊天摘要專家，請幫我整理昨日聊天內容（時間範圍：{start:%Y-%m-%d 00:00} ~ {end:%Y-%m-%d 00:00}），輸出格式必須如下（保持中文，條列式）：
 
 昨日聊天摘要 ({start.date()}):
  群組聊天記錄摘要
-
 1. 關鍵決策：
    - 請列出昨天討論中做出的決策或結論
 2. 待辦事項：
@@ -53,26 +76,31 @@ async def summarize_for_single_chat(http: httpx.AsyncClient, chat_id: str):
 
 以下是聊天記錄：
 {text}
-"""
+""".strip()
     summary = await openai_client.summarize_text_or_fallback(http, prompt)
-    await lark_client.send_text_to_chat(http, chat_id, f"【昨日聊天摘要】\n{summary}")
+    await _send_text(http, chat_id, f"【昨日聊天摘要】\n{summary}")
 
 async def summarize_for_all_chats(http: httpx.AsyncClient):
-    """
-    對所有群組執行昨日摘要（保留你原本 API）。
-    """
-    chats = await crud.get_all_chats()
-    for chat in chats:
+    chat_ids: list[str] = []
+    if _HAS_CRUD and hasattr(crud, "get_all_chats"):
         try:
-            await summarize_for_single_chat(http, chat["chat_id"])
+            chats = await crud.get_all_chats()  # type: ignore
+            chat_ids = [c["chat_id"] for c in chats if isinstance(c, dict) and c.get("chat_id")]
         except Exception as e:
-            logger.error(f"摘要失敗 chat={chat.get('chat_id')} error={e}")
+            logger.error("讀取群組列表失敗：%s", e)
+    if not chat_ids:
+        chat_ids = _summary_chat_ids()
+
+    for cid in chat_ids:
+        try:
+            await summarize_for_single_chat(http, cid)
+        except Exception as e:
+            logger.error("摘要失敗 chat=%s err=%s", cid, e)
 
 async def record_message(event: dict):
-    """
-    儲存聊天訊息到資料庫（健壯解析，避免 KeyError）。
-    僅存純文字內容，其他型別你可在 crud 端擴充欄位。
-    """
+    """寫 DB：若無 crud.save_message 則安靜略過。"""
+    if not (_HAS_CRUD and hasattr(crud, "save_message")):
+        return
     try:
         ev = event.get("event", {}) or {}
         msg = ev.get("message", {}) or {}
@@ -85,34 +113,23 @@ async def record_message(event: dict):
         text = (content.get("text") or "").strip()
         sender = (ev.get("sender", {}) or {}).get("sender_id", {}).get("open_id") or ""
         ts_ms = msg.get("create_time")
-        if ts_ms is None:
-            # 退而求其次：utils.now_local
-            ts = utils.now_local() if hasattr(utils, "now_local") else datetime.now(TZ)
-        else:
-            ts = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=TZ)
-
+        ts = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=TZ) if ts_ms else datetime.now(TZ)
         if chat_id and text:
-            await crud.save_message(chat_id, sender, text, ts)
+            await crud.save_message(chat_id, sender, text, ts)  # type: ignore
     except Exception as e:
-        logger.error(f"記錄訊息失敗: {e}")
+        logger.error("記錄訊息失敗: %s", e)
 
-# =========================
-# （供 Worker 使用）每天 08:30 發昨日摘要
-# =========================
+# ====== Scheduler：每天 08:30 (Asia/Taipei) 發昨日摘要 ======
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 async def _run_daily_summary():
+    logger.info("Daily summary job start")
     async with httpx.AsyncClient() as http:
         await summarize_for_all_chats(http)
 
 def setup_scheduler():
-    """
-    由 scheduler_worker 或啟動程序呼叫。
-    Asia/Taipei 每天 08:30 觸發 _run_daily_summary。
-    """
     scheduler = AsyncIOScheduler(timezone=TZ)
-    # 08:30 觸發（台北）
-    scheduler.add_job(_run_daily_summary, CronTrigger(hour=8, minute=30))
+    scheduler.add_job(_run_daily_summary, CronTrigger(hour=8, minute=30, second=0))
     scheduler.start()
-    logger.info("Scheduler started with TZ=Asia/Taipei; next run 08:30 daily")
+    logger.info("Scheduler started (08:30 Asia/Taipei)")
