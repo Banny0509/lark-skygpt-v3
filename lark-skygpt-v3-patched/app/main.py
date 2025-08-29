@@ -1,3 +1,4 @@
+# app/main.py
 import os
 import json
 import time
@@ -7,7 +8,7 @@ from typing import Any, Dict
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 
 from .config import settings
 from .openai_client import (
@@ -15,10 +16,9 @@ from .openai_client import (
     summarize_text_or_fallback,
     describe_image_from_message_or_fallback,
     describe_pdf_from_message_or_fallback,
-    _download_message_resource,  # 從訊息端點下載檔案
 )
 
-# 若有 tasks 就寫庫供每日摘要用；沒有也不影響主流程
+# 若有 tasks 則掛上；沒有也不影響主要流程（摘要/落庫/管理命令）
 try:
     from . import tasks  # noqa
     _HAS_TASKS = True
@@ -27,17 +27,20 @@ except Exception:
     _HAS_TASKS = False
 
 logger = logging.getLogger("sky_lark")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=getattr(logging, (os.getenv("LOG_LEVEL") or "INFO").upper(), logging.INFO))
 
 app = FastAPI()
 
 # =========================
-# Lark Token / 發送文字（輕量 helper）
+# Lark：租戶 Token & 發送文字
 # =========================
 LARK_TENANT_TOKEN_URL = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
 LARK_SEND_MESSAGE_URL = "https://open.larksuite.com/open-apis/im/v1/messages"
 
 def _resolve_lark_credentials() -> tuple[str, str]:
+    """
+    兼容多種命名：LARK_* / FEISHU_* / APP_*
+    """
     app_id = (
         getattr(settings, "LARK_APP_ID", None)
         or getattr(settings, "FEISHU_APP_ID", None)
@@ -68,6 +71,9 @@ async def _get_tenant_access_token(http: httpx.AsyncClient) -> str:
     return tok
 
 async def reply_text(http: httpx.AsyncClient, chat_id: str, text: str, *, by_chat_id: bool = True) -> None:
+    """
+    發送純文字訊息到指定 chat_id
+    """
     try:
         token = await _get_tenant_access_token(http)
     except Exception as e:
@@ -123,6 +129,7 @@ async def _dedupe_mark(message_id: str) -> bool:
             return False
         except Exception:
             pass
+    # 本地降級
     now = time.time()
     for k, ts in list(_local_seen.items()):
         if now - ts > _LOCAL_TTL:
@@ -180,6 +187,32 @@ def _bot_is_mentioned(msg: dict, content_text: str) -> bool:
     return False
 
 # =========================
+# 事件類型解析 & Bot 入群登記
+# =========================
+def _event_type_of(payload: Dict[str, Any]) -> str:
+    h = payload.get("header") or {}
+    return (h.get("event_type") or "").strip()
+
+async def handle_bot_added_event(event: Dict[str, Any]) -> None:
+    """
+    機器人被加入群：自動登記 Chat（chat_id/name），開啟每日摘要。
+    """
+    try:
+        ev = event.get("event", {}) or {}
+        chat = ev.get("chat", {}) or {}
+        chat_id = chat.get("chat_id") or ev.get("chat_id")
+        name = chat.get("name") or ev.get("chat_name")
+        if not chat_id:
+            return
+        from .database import AsyncSessionFactory
+        from . import crud
+        async with AsyncSessionFactory() as db:
+            await crud.upsert_chat(db, chat_id, name)
+        logger.info("bot added: chat_id=%s name=%s", chat_id, name)
+    except Exception as e:
+        logger.debug("handle_bot_added_event error: %s", e)
+
+# =========================
 # Webhook：固定 /webhook/lark（即時回 200、背景處理）
 # =========================
 @app.post("/webhook/lark")
@@ -192,7 +225,18 @@ async def lark_webhook(request: Request):
     if isinstance(event, dict) and "challenge" in event:
         return JSONResponse({"challenge": event["challenge"]}, status_code=200)
 
-    asyncio.create_task(_process_lark_event(event))
+    et = _event_type_of(event)
+    # 入群事件：登記 Chat
+    if et == "im.chat.member.bot.added_v1":
+        asyncio.create_task(handle_bot_added_event(event))
+        return JSONResponse({"msg": "ok"}, status_code=200)
+
+    # 訊息事件：進入消息處理管線
+    if et == "im.message.receive_v1":
+        asyncio.create_task(_process_lark_event(event))
+        return JSONResponse({"msg": "ok"}, status_code=200)
+
+    # 其他事件忽略
     return JSONResponse({"msg": "ok"}, status_code=200)
 
 # 相容舊路由
@@ -215,13 +259,14 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
     chat_id = msg.get("chat_id")
     content_raw = msg.get("content", "{}")
 
-    # 非阻塞寫庫（若有）
+    # 非阻塞寫庫（若有 tasks）
     if _HAS_TASKS and hasattr(tasks, "record_message"):
         try:
             asyncio.create_task(tasks.record_message(event))
         except Exception as _e:
             logger.debug("record_message 啟動失敗：%s", _e)
 
+    # 解析內容
     try:
         content = json.loads(content_raw) if isinstance(content_raw, str) else (content_raw or {})
     except Exception:
@@ -246,7 +291,18 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
             text = (text_in or "").strip()
             if not text:
                 return
+
+            # 先處理群內管理命令（#summary ...）
+            if _HAS_TASKS and hasattr(tasks, "maybe_handle_summary_command"):
+                try:
+                    await tasks.maybe_handle_summary_command(event)
+                    # 命令類訊息不一定需要再回覆 AI，可按需繼續執行或直接 return
+                    # 這裡選擇繼續，若命令不屬於 #summary，則下方會正常 AI 回覆
+                except Exception as _e:
+                    logger.debug("maybe_handle_summary_command failed: %s", _e)
+
             try:
+                # 若使用者輸入“摘要/總結/summary”，示意直接走摘要模型
                 if text in ("摘要", "總結", "总结", "summary"):
                     reply = await summarize_text_or_fallback(http, text)
                 else:
@@ -254,6 +310,7 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
             except Exception as e:
                 logger.exception("處理文字訊息失敗：%s", e)
                 reply = "(降級) 處理文字訊息時發生例外，已記錄日誌。"
+
             await reply_text(http, chat_id, reply, by_chat_id=True)
             return
 
@@ -273,7 +330,7 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
             await reply_text(http, chat_id, result, by_chat_id=True)
             return
 
-        # 檔案：PDF（@ 才處理）；DOCX/XLSX 可選擇開啟
+        # 檔案（PDF）：@ 才處理；DOCX/XLSX 可按需開啟
         if msg_type == "file":
             if require_mention and not mentioned:
                 return
@@ -292,18 +349,7 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
                 await reply_text(http, chat_id, result, by_chat_id=True)
                 return
 
-            # 其他格式提示（若要啟用 DOCX/XLSX 摘要，打開下方兩段）
-            # if file_name.endswith(".docx"):
-            #     data = await _download_message_resource(http, message_id, file_key, rtype="file")
-            #     text = _extract_docx_text(data)
-            #     result = await summarize_text_or_fallback(http, text)
-            #     await reply_text(http, chat_id, result, by_chat_id=True); return
-            # if file_name.endswith(".xlsx"):
-            #     data = await _download_message_resource(http, message_id, file_key, rtype="file")
-            #     text = _extract_xlsx_text(data)
-            #     result = await summarize_text_or_fallback(http, text)
-            #     await reply_text(http, chat_id, result, by_chat_id=True); return
-
+            # 其他格式提示（如要支持 DOCX/XLSX，可參考 openai_client 的下載端點自行擴展）
             await reply_text(
                 http, chat_id,
                 f"(提示) 已接收檔案：{file_name or file_key}。目前僅對 PDF 走 Vision；如需 DOCX/XLSX 請告知。",
@@ -314,33 +360,3 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
         # 其他型別：略過
         return
 
-# ===== DOCX / XLSX 輔助（若要啟用） =====
-def _extract_docx_text(data: bytes) -> str:
-    try:
-        from io import BytesIO
-        from docx import Document
-        doc = Document(BytesIO(data))
-        parts = [p.text for p in doc.paragraphs if p.text]
-        return "\n".join(parts).strip() or "(空白文件)"
-    except Exception as e:
-        return f"(降級) DOCX 解析失敗：{e}"
-
-def _extract_xlsx_text(data: bytes, max_rows: int = 50, max_cols: int = 20) -> str:
-    try:
-        from io import BytesIO
-        from openpyxl import load_workbook
-        wb = load_workbook(BytesIO(data), read_only=True, data_only=True)
-        ws = wb.active
-        rows = []
-        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-            if r_idx > max_rows:
-                rows.append("...（已截斷）"); break
-            cells = []
-            for c_idx, v in enumerate(row, start=1):
-                if c_idx > max_cols:
-                    cells.append("…"); break
-                cells.append("" if v is None else str(v))
-            rows.append("\t".join(cells))
-        return f"[工作表：{ws.title}]\n" + "\n".join(rows)
-    except Exception as e:
-        return f"(降級) XLSX 解析失敗：{e}"
