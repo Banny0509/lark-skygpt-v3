@@ -120,5 +120,3 @@ async def acquire_summary_lock(db: AsyncSession, summary_date: str, chat_id: str
     except Exception:
         await db.rollback()
         return False
-
-   
