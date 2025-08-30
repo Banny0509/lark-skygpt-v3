@@ -296,13 +296,10 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
             if _HAS_TASKS and hasattr(tasks, "maybe_handle_summary_command"):
                 try:
                     await tasks.maybe_handle_summary_command(event)
-                    # 命令類訊息不一定需要再回覆 AI，可按需繼續執行或直接 return
-                    # 這裡選擇繼續，若命令不屬於 #summary，則下方會正常 AI 回覆
                 except Exception as _e:
                     logger.debug("maybe_handle_summary_command failed: %s", _e)
 
             try:
-                # 若使用者輸入“摘要/總結/summary”，示意直接走摘要模型
                 if text in ("摘要", "總結", "总结", "summary"):
                     reply = await summarize_text_or_fallback(http, text)
                 else:
@@ -330,7 +327,7 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
             await reply_text(http, chat_id, result, by_chat_id=True)
             return
 
-        # 檔案（PDF）：@ 才處理；DOCX/XLSX 可按需開啟
+        # 檔案（PDF）
         if msg_type == "file":
             if require_mention and not mentioned:
                 return
@@ -349,7 +346,6 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
                 await reply_text(http, chat_id, result, by_chat_id=True)
                 return
 
-            # 其他格式提示（如要支持 DOCX/XLSX，可參考 openai_client 的下載端點自行擴展）
             await reply_text(
                 http, chat_id,
                 f"(提示) 已接收檔案：{file_name or file_key}。目前僅對 PDF 走 Vision；如需 DOCX/XLSX 請告知。",
@@ -359,4 +355,3 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
 
         # 其他型別：略過
         return
-
