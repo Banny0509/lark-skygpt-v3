@@ -30,6 +30,7 @@ def _yesterday_range(tz: str = DEFAULT_TZ) -> tuple[datetime, datetime]:
     return start, end
 
 # ============ 记录消息：由 webhook 异步触发 ============
+async de
 async def record_message(event: dict) -> None:
     try:
         ev = event.get("event", {}) or {}
@@ -41,24 +42,26 @@ async def record_message(event: dict) -> None:
             return
         msg_type = msg.get("message_type") or "text"
         content_raw = msg.get("content") or "{}"
-        sender = (msg.get("sender") or {}).get("sender_id") or ""
+        sender = (msg.get("sender") or {}).get("id") or (msg.get("sender") or {}).get("sender_id") or ""
         ts_ms = int(msg.get("create_time") or 0)
-
         try:
             content = json.loads(content_raw) if isinstance(content_raw, str) else (content_raw or {})
         except Exception:
             content = {}
         text = (content.get("text") or "").strip() if isinstance(content, dict) else ""
-
         if msg_type == "text" and text:
             async with AsyncSessionFactory() as db:
+                                await crud.upsert_chat(db, chat_id, None)
+
                 await crud.save_message(db, chat_id=chat_id, text=text, sender_id=sender, ts_ms=ts_ms, msg_type="text")
-                                            await crud.
-                                            await crud.upsert_chat(db, chat_id, None)
+                
     except Exception as e:
         logger.debug("record_message failed: %s", e)
 
-# ============ 群管理命令：#summary on/off/at/tz/lang/once ============
+
+            
+           
+        ====== 群管理命令：#summary on/off/at/tz/lang/once ============
 async def maybe_handle_summary_command(event: dict) -> None:
     ev = event.get("event", {}) or {}
     msg = ev.get("message", {}) or {}
