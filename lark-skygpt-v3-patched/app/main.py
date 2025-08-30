@@ -245,7 +245,7 @@ async def lark_webhook_alias(request: Request):
     return await lark_webhook(request)
 
 # =========================
-# 背景處理：僅群組被 @ 才回；私聊照舊
+# 背景處理：加入兜底「#summary 直達」邏輯
 # =========================
 async def _process_lark_event(event: Dict[str, Any]) -> None:
     header = event.get("header", {}) or {}
@@ -280,6 +280,18 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
             return
 
     text_in = (content.get("text") or "") if isinstance(content, dict) else ""
+    text_stripped = (text_in or "").strip()
+    lower = text_stripped.lower()
+
+    # —— 兜底：不管有没有 @，只要是 #summary 指令，直接转交 tasks，保证有回应 ——
+    if lower.startswith("#summary") and _HAS_TASKS and hasattr(tasks, "maybe_handle_summary_command"):
+        try:
+            await tasks.maybe_handle_summary_command(event)
+        except Exception as e:
+            logger.error("force forward summary command failed: %s", e)
+        return
+
+    # 正常路径：群聊需要被 @ 才回复；单聊直接处理
     require_mention = not _is_p2p_chat(msg)
     mentioned = _bot_is_mentioned(msg, text_in)
 
@@ -288,11 +300,10 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
         if msg_type == "text":
             if require_mention and not mentioned:
                 return
-            text = (text_in or "").strip()
-            if not text:
+            if not text_stripped:
                 return
 
-            # 先處理群內管理命令（#summary ...）
+            # 常规命令处理（有 @ 的情况）
             if _HAS_TASKS and hasattr(tasks, "maybe_handle_summary_command"):
                 try:
                     await tasks.maybe_handle_summary_command(event)
@@ -300,10 +311,10 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
                     logger.debug("maybe_handle_summary_command failed: %s", _e)
 
             try:
-                if text in ("摘要", "總結", "总结", "summary"):
-                    reply = await summarize_text_or_fallback(http, text)
+                if text_stripped in ("摘要", "總結", "总结", "summary"):
+                    reply = await summarize_text_or_fallback(http, text_stripped)
                 else:
-                    reply = await reply_text_or_fallback(http, text)
+                    reply = await reply_text_or_fallback(http, text_stripped)
             except Exception as e:
                 logger.exception("處理文字訊息失敗：%s", e)
                 reply = "(降級) 處理文字訊息時發生例外，已記錄日誌。"
