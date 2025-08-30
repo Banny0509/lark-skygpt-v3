@@ -53,6 +53,7 @@ async def record_message(event: dict) -> None:
         if msg_type == "text" and text:
             async with AsyncSessionFactory() as db:
                 await crud.save_message(db, chat_id=chat_id, text=text, sender_id=sender, ts_ms=ts_ms, msg_type="text")
+                                        await crud.upsert_chat(db, chat_id, None)  
     except Exception as e:
         logger.debug("record_message failed: %s", e)
 
