@@ -26,7 +26,7 @@ except Exception:
     tasks = None  # type: ignore
     _HAS_TASKS = False
 
-logger = logging.getLogger("sky_lark")
+logger = logging.getLogger("web")
 logging.basicConfig(level=getattr(logging, (os.getenv("LOG_LEVEL") or "INFO").upper(), logging.INFO))
 
 app = FastAPI()
@@ -38,9 +38,6 @@ LARK_TENANT_TOKEN_URL = "https://open.larksuite.com/open-apis/auth/v3/tenant_acc
 LARK_SEND_MESSAGE_URL = "https://open.larksuite.com/open-apis/im/v1/messages"
 
 def _resolve_lark_credentials() -> tuple[str, str]:
-    """
-    兼容多種命名：LARK_* / FEISHU_* / APP_*
-    """
     app_id = (
         getattr(settings, "LARK_APP_ID", None)
         or getattr(settings, "FEISHU_APP_ID", None)
@@ -71,13 +68,11 @@ async def _get_tenant_access_token(http: httpx.AsyncClient) -> str:
     return tok
 
 async def reply_text(http: httpx.AsyncClient, chat_id: str, text: str, *, by_chat_id: bool = True) -> None:
-    """
-    發送純文字訊息到指定 chat_id
-    """
+    """發送純文字訊息到指定 chat_id（含 Debug 日誌）"""
     try:
         token = await _get_tenant_access_token(http)
     except Exception as e:
-        logger.error("無法發送訊息：%s", e)
+        logger.error("reply_text: 無法取得租戶 token：%s", e)
         return
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
     params = {"receive_id_type": "chat_id" if by_chat_id else "open_id"}
@@ -86,13 +81,13 @@ async def reply_text(http: httpx.AsyncClient, chat_id: str, text: str, *, by_cha
         resp = await http.post(LARK_SEND_MESSAGE_URL, headers=headers, params=params, json=body, timeout=20)
         if resp.status_code >= 400:
             errtxt = (await resp.aread()).decode(errors="ignore")
-            logger.error("回覆訊息失敗 %s: %s", resp.status_code, errtxt)
+            logger.error("reply_text 失敗 %s: %s", resp.status_code, errtxt)
+        else:
+            logger.info("reply_text 成功 -> chat_id=%s, len(text)=%s", chat_id, len(text))
     except Exception as e:
-        logger.exception("回覆訊息發送異常：%s", e)
+        logger.exception("reply_text 發送異常：%s", e)
 
-# =========================
-# 健康檢查
-# =========================
+# ========================= 健康檢查 =========================
 @app.get("/")
 async def root_ok():
     return {"ok": True, "service": "web", "env": getattr(settings, "ENV", "prod")}
@@ -105,9 +100,7 @@ async def healthz():
 async def health_alias():
     return await healthz()
 
-# =========================
-# 去重（Lark 會重試）
-# =========================
+# ========================= 去重（Lark 會重試） =========================
 try:
     import redis.asyncio as aioredis
 except Exception:
@@ -129,7 +122,6 @@ async def _dedupe_mark(message_id: str) -> bool:
             return False
         except Exception:
             pass
-    # 本地降級
     now = time.time()
     for k, ts in list(_local_seen.items()):
         if now - ts > _LOCAL_TTL:
@@ -139,9 +131,7 @@ async def _dedupe_mark(message_id: str) -> bool:
     _local_seen[key] = now
     return True
 
-# =========================
-# 判斷群組是否 @ 機器人
-# =========================
+# ========================= 判斷群組是否 @ 機器人 =========================
 def _is_p2p_chat(msg: dict) -> bool:
     chat_type = (msg.get("chat_type") or "").lower()
     return chat_type in ("p2p", "single", "private", "p2p_chat")
@@ -177,7 +167,7 @@ def _bot_is_mentioned(msg: dict, content_text: str) -> bool:
         if isinstance(mid, str) and app_id and app_id in mid.lower():
             return True
     text = content_text or ""
-    if "<at" in text:  # 富文本
+    if "<at" in text:
         return True
     bot_name = os.getenv("BOT_NAME") or ""
     if bot_name and (f"@{bot_name}" in text):
@@ -186,17 +176,12 @@ def _bot_is_mentioned(msg: dict, content_text: str) -> bool:
         return True
     return False
 
-# =========================
-# 事件類型解析 & Bot 入群登記
-# =========================
+# ========================= 事件類型解析 & Bot 入群登記 =========================
 def _event_type_of(payload: Dict[str, Any]) -> str:
     h = payload.get("header") or {}
     return (h.get("event_type") or "").strip()
 
 async def handle_bot_added_event(event: Dict[str, Any]) -> None:
-    """
-    機器人被加入群：自動登記 Chat（chat_id/name），開啟每日摘要。
-    """
     try:
         ev = event.get("event", {}) or {}
         chat = ev.get("chat", {}) or {}
@@ -212,9 +197,7 @@ async def handle_bot_added_event(event: Dict[str, Any]) -> None:
     except Exception as e:
         logger.debug("handle_bot_added_event error: %s", e)
 
-# =========================
-# Webhook：固定 /webhook/lark（即時回 200、背景處理）
-# =========================
+# ========================= Webhook =========================
 @app.post("/webhook/lark")
 async def lark_webhook(request: Request):
     try:
@@ -226,27 +209,23 @@ async def lark_webhook(request: Request):
         return JSONResponse({"challenge": event["challenge"]}, status_code=200)
 
     et = _event_type_of(event)
-    # 入群事件：登記 Chat
+    logger.info("webhook received, type=%s", et)
+
     if et == "im.chat.member.bot.added_v1":
         asyncio.create_task(handle_bot_added_event(event))
         return JSONResponse({"msg": "ok"}, status_code=200)
 
-    # 訊息事件：進入消息處理管線
     if et == "im.message.receive_v1":
         asyncio.create_task(_process_lark_event(event))
         return JSONResponse({"msg": "ok"}, status_code=200)
 
-    # 其他事件忽略
     return JSONResponse({"msg": "ok"}, status_code=200)
 
-# 相容舊路由
 @app.post("/lark/webhook")
 async def lark_webhook_alias(request: Request):
     return await lark_webhook(request)
 
-# =========================
-# 背景處理：加入兜底「#summary 直達」邏輯
-# =========================
+# ========================= 背景處理（帶兜底） =========================
 async def _process_lark_event(event: Dict[str, Any]) -> None:
     header = event.get("header", {}) or {}
     if header.get("event_type") != "im.message.receive_v1":
@@ -254,10 +233,11 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
 
     ev = event.get("event", {}) or {}
     msg = ev.get("message", {}) or {}
-    msg_type = msg.get("message_type")
+    msg_type = (msg.get("message_type") or "").lower()
     message_id = msg.get("message_id")
     chat_id = msg.get("chat_id")
     content_raw = msg.get("content", "{}")
+    logger.info("process_event start: chat_id=%s, msg_type=%s, msg_id=%s", chat_id, msg_type, message_id)
 
     # 非阻塞寫庫（若有 tasks）
     if _HAS_TASKS and hasattr(tasks, "record_message"):
@@ -273,30 +253,34 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
         content = {}
 
     if not chat_id:
+        logger.info("process_event: missing chat_id, skip")
         return
     if message_id:
         first = await _dedupe_mark(message_id)
         if not first:
+            logger.info("process_event: duplicate msg, skip, msg_id=%s", message_id)
             return
 
     text_in = (content.get("text") or "") if isinstance(content, dict) else ""
     text_stripped = (text_in or "").strip()
     lower = text_stripped.lower()
+    logger.info("process_event text='%s'", text_stripped[:100])
 
-    # —— 兜底：不管有没有 @，只要是 #summary 指令，直接转交 tasks，保证有回应 ——
+    # —— 兜底：凡是 #summary 指令，直接轉交 tasks，保證有回覆 ——
     if lower.startswith("#summary") and _HAS_TASKS and hasattr(tasks, "maybe_handle_summary_command"):
         try:
+            logger.info("process_event: force forward summary command")
             await tasks.maybe_handle_summary_command(event)
         except Exception as e:
             logger.error("force forward summary command failed: %s", e)
         return
 
-    # 正常路径：群聊需要被 @ 才回复；单聊直接处理
+    # 正常分支：群聊需被 @ 才回覆；單聊直接處理
     require_mention = not _is_p2p_chat(msg)
     mentioned = _bot_is_mentioned(msg, text_in)
+    logger.info("process_event: require_mention=%s, mentioned=%s", require_mention, mentioned)
 
     async with httpx.AsyncClient() as http:
-        # 文字
         if msg_type == "text":
             if require_mention and not mentioned:
                 return
@@ -364,5 +348,5 @@ async def _process_lark_event(event: Dict[str, Any]) -> None:
             )
             return
 
-        # 其他型別：略過
         return
+
