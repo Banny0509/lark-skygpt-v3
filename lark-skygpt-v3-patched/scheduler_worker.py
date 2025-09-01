@@ -1,4 +1,4 @@
-# scheduler_worker.py
+# app/scheduler_worker.py
 import os
 import asyncio
 import logging
@@ -13,7 +13,7 @@ from app.config import settings
 from app.database import init_db, AsyncSessionFactory
 from app import crud, tasks
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("main")
 logging.basicConfig(level=getattr(logging, (os.getenv("LOG_LEVEL") or "INFO").upper(), logging.INFO))
 
 DEFAULT_TZ = getattr(settings, "TIMEZONE", "Asia/Taipei") or "Asia/Taipei"
@@ -44,7 +44,7 @@ async def _run_hourly_scan():
     async with AsyncSessionFactory() as db:
         chats = await crud.get_all_chats(db)
     if not chats:
-        logger.info("hourly-scan: no active chats")
+        logger.info("__main__:hourly-scan: no active chats")
         return
 
     async with httpx.AsyncClient(timeout=20) as http:
@@ -88,4 +88,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
