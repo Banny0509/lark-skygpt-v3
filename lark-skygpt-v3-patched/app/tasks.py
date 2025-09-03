@@ -9,7 +9,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, time as dt_time, date
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple
 
 import httpx
 from zoneinfo import ZoneInfo
@@ -18,30 +18,31 @@ from .openai_client import summarize_text_or_fallback
 from .database import AsyncSessionFactory
 from . import crud
 
-# 優先使用 main.reply_text；若不可用，以 lark_client 兜底
+# 优先使用 main.reply_text（Web 端），若不可用，则由 lark_client 兜底（Worker 端）
 try:
     from .main import reply_text  # type: ignore
 except Exception:
     reply_text = None  # type: ignore
 
-# ---- Redis（用於臨時管理員會話）----
+# Redis（可选，用于“管理员会话”）
 try:
     import redis.asyncio as aioredis  # type: ignore
 except Exception:
-    aioredis = None  # 沒有就不啟用登入機制（fallback 不報錯）
+    aioredis = None
 
 REDIS_URL = os.getenv("REDIS_URL") or os.getenv("REDIS_CONNECTION_URL") or ""
-ADMIN_CODE = os.getenv("SUMMARY_ADMIN_CODE", "")  # 你在 Railway 設定的一組口令
-ADMIN_TTL_SEC = int(os.getenv("SUMMARY_ADMIN_TTL_SEC", "21600"))  # 管理員會話有效期（預設6小時）
-MAX_RANGE_DAYS = int(os.getenv("SUMMARY_MAX_RANGE_DAYS", "31"))   # 範圍整理最多天數
+ADMIN_CODE = os.getenv("SUMMARY_ADMIN_CODE", "")                 # 口令
+ADMIN_TTL_SEC = int(os.getenv("SUMMARY_ADMIN_TTL_SEC", "21600")) # 管理员会话有效期默认 6 小时
+MAX_RANGE_DAYS = int(os.getenv("SUMMARY_MAX_RANGE_DAYS", "31"))  # 区间最大天数
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=getattr(logging, (os.getenv("LOG_LEVEL") or "INFO").upper(), logging.INFO))
 
 DEFAULT_TZ = ZoneInfo("Asia/Taipei")
+_redis = aioredis.from_url(REDIS_URL) if (aioredis and REDIS_URL) else None
 
 
-# ---------- 發訊息統一入口 ----------
+# ======================= 统一回覆 =======================
 async def _send_reply(http: httpx.AsyncClient, chat_id: str, text: str) -> None:
     """reply_text → lark_client.send_text_to_chat（兜底）"""
     try:
@@ -59,29 +60,41 @@ async def _send_reply(http: httpx.AsyncClient, chat_id: str, text: str) -> None:
         pass
 
 
-# ---------- Redis / Admin Session ----------
-_redis = aioredis.from_url(REDIS_URL) if (aioredis and REDIS_URL) else None
-
+# ======================= 管理员会话（用户/群 双通道） =======================
 async def _set_admin(open_id: str) -> None:
-    if not _redis:
+    if not _redis or not open_id:
         return
-    key = f"summary:admin:{open_id}"
-    await _redis.set(key, "1", ex=ADMIN_TTL_SEC)
+    await _redis.set(f"summary:admin:{open_id}", "1", ex=ADMIN_TTL_SEC)
 
 async def _del_admin(open_id: str) -> None:
-    if not _redis:
+    if not _redis or not open_id:
         return
     await _redis.delete(f"summary:admin:{open_id}")
 
-async def _is_admin(open_id: str) -> bool:
+async def _set_admin_chat(chat_id: str) -> None:
+    if not _redis or not chat_id:
+        return
+    await _redis.set(f"summary:admin_chat:{chat_id}", "1", ex=ADMIN_TTL_SEC)
+
+async def _del_admin_chat(chat_id: str) -> None:
+    if not _redis or not chat_id:
+        return
+    await _redis.delete(f"summary:admin_chat:{chat_id}")
+
+async def _is_admin_both(open_id: str, chat_id: str) -> bool:
+    """既检查用户会话，也检查当前群会话"""
     if not _redis:
-        # 若沒 Redis，當 ADMIN_CODE 也沒設，就視為關閉“全域”指令能力
         return False
-    v = await _redis.get(f"summary:admin:{open_id}")
-    return bool(v)
+    if open_id:
+        if await _redis.get(f"summary:admin:{open_id}"):
+            return True
+    if chat_id:
+        if await _redis.get(f"summary:admin_chat:{chat_id}"):
+            return True
+    return False
 
 
-# ---------- 時間區間工具 ----------
+# ======================= 时间区间工具 =======================
 def _yesterday_range(tz: str | ZoneInfo = DEFAULT_TZ) -> tuple[datetime, datetime]:
     tz_obj = ZoneInfo(str(tz)) if isinstance(tz, str) else tz
     now = datetime.now(tz_obj)
@@ -92,18 +105,20 @@ def _yesterday_range(tz: str | ZoneInfo = DEFAULT_TZ) -> tuple[datetime, datetim
     return start, end
 
 def _parse_range(text: str) -> Tuple[date, date] | None:
-    """解析 'range YYYY-MM-DD to YYYY-MM-DD' 或 'range YYYY-MM-DD - YYYY-MM-DD'"""
+    """
+    解析 'range YYYY-MM-DD to YYYY-MM-DD' 或 'range YYYY-MM-DD - YYYY-MM-DD'
+    """
     m = re.search(r"range\s+(\d{4}-\d{2}-\d{2})\s*(?:to|-)\s*(\d{4}-\d{2}-\d{2})", text)
     if not m:
         return None
     try:
         d1 = datetime.strptime(m.group(1), "%Y-%m-%d").date()
         d2 = datetime.strptime(m.group(2), "%Y-%m-%d").date()
-        if d2 < d1:
-            return None
-        return d1, d2
     except Exception:
         return None
+    if d2 < d1:
+        return None
+    return d1, d2
 
 def _start_end_from_dates(d1: date, d2: date, tz: str | ZoneInfo = DEFAULT_TZ) -> Tuple[datetime, datetime]:
     tz_obj = ZoneInfo(str(tz)) if isinstance(tz, str) else tz
@@ -112,10 +127,10 @@ def _start_end_from_dates(d1: date, d2: date, tz: str | ZoneInfo = DEFAULT_TZ) -
     return start, end
 
 
-# ======================= 訊息記錄（僅落庫） =======================
+# ======================= 记录消息（仅落库） =======================
 async def record_message(event: Dict[str, Any]) -> None:
     """
-    只負責落庫（文字型別）；不觸發摘要指令，避免重覆回覆。
+    只负责把文字消息写入 DB；不触发摘要指令（避免重复回复）。
     """
     try:
         ev = event.get("event", {}) or {}
@@ -134,7 +149,7 @@ async def record_message(event: Dict[str, Any]) -> None:
             content = {}
         text = (content.get("text") or "").strip() if isinstance(content, dict) else ""
 
-        # 取 sender_id（如有）
+        # 取 sender_id
         sender_id = ""
         s = msg.get("sender") or {}
         if isinstance(s, dict):
@@ -144,7 +159,7 @@ async def record_message(event: Dict[str, Any]) -> None:
             else:
                 sender_id = s.get("sender_id") or s.get("open_id") or (sid if isinstance(sid, str) else "")
 
-        # 毫秒時間戳
+        # 毫秒时间戳
         try:
             ts_ms = int(msg.get("create_time") or 0)
         except Exception:
@@ -152,22 +167,27 @@ async def record_message(event: Dict[str, Any]) -> None:
 
         if msg_type == "text" and text:
             async with AsyncSessionFactory() as db:
-                await crud.upsert_chat(db, chat_id, None)  # 確保 chat 存在（enabled 狀態由指令維護）
+                await crud.upsert_chat(db, chat_id, None)  # 只确保群存在；enabled 由指令维护
                 await crud.save_message(db, chat_id=chat_id, text=text, sender_id=sender_id, ts_ms=ts_ms, msg_type="text")
     except Exception as e:
         logger.debug(f"record_message error: {e}")
 
 
-# ======================= 指令處理 =======================
+# ======================= 指令处理 =======================
 async def maybe_handle_summary_command(event: Dict[str, Any]) -> None:
     """
-    支援：
-      #summary login <code>            -> 登入成為臨時管理員（6小時）
-      #summary logout                  -> 退出管理員
-      #summary on / off / at / tz / lang / once
-      #summary range YYYY-MM-DD to YYYY-MM-DD
-      #summary all range YYYY-MM-DD to YYYY-MM-DD  -> 需要臨時管理員
-      #summary enable all              -> 將 DB 內所有群設為 enabled（需要臨時管理員）
+    支持：
+      #summary login <code>        -> 口令登录管理员（无 open_id 则按“本群会话”登录）
+      #summary logout              -> 登出（用户 & 本群）
+      #summary once                -> 立即整理昨日
+      #summary off                 -> 关闭每日摘要
+      #summary on                  -> 开启每日摘要
+      #summary at HH               -> 设置每日摘要小时 0~23
+      #summary tz Asia/Taipei      -> 设置时区
+      #summary lang zh|en          -> 设置语言
+      #summary range 2025-08-01 to 2025-08-07
+      #summary all range 2025-08-01 to 2025-08-07   -> 需要管理员（用户或本群登录）
+      #summary enable all          -> 将“本群”设为启用（避免误操作一键启全部）
     """
     try:
         ev = event.get("event", {}) or {}
@@ -180,21 +200,24 @@ async def maybe_handle_summary_command(event: Dict[str, Any]) -> None:
             content = {}
         text = (content.get("text") or "").strip()
         low = text.lower()
-
         if not chat_id or not low.startswith("#summary"):
             return
 
-        # 取得 sender_open_id（作為管理員會話身份）
+        # 取得 sender_open_id（优先 event.sender.sender_id.open_id；再回退到 message.sender）
         sender_open_id = ""
-        s = msg.get("sender") or {}
-        if isinstance(s, dict):
-            sid = s.get("id")
-            if isinstance(sid, dict):
-                sender_open_id = sid.get("open_id") or ""
-            else:
-                sender_open_id = s.get("open_id") or ""
+        sender_ev = ev.get("sender") or {}
+        sid_ev = sender_ev.get("sender_id") if isinstance(sender_ev, dict) else None
+        if isinstance(sid_ev, dict):
+            sender_open_id = sid_ev.get("open_id") or sid_ev.get("user_id") or sid_ev.get("union_id") or ""
+        else:
+            sender_open_id = sender_ev.get("open_id") if isinstance(sender_ev, dict) else ""
+        if not sender_open_id:
+            sender_msg = msg.get("sender") or {}
+            sid_msg = sender_msg.get("sender_id") or sender_msg.get("id")
+            if isinstance(sid_msg, dict):
+                sender_open_id = sid_msg.get("open_id") or sender_open_id
 
-        # ===== 登入 / 登出（不需 DB）=====
+        # ===== 登录 / 登出（不依赖 DB）=====
         if low.startswith("#summary login"):
             code = text.split(None, 2)[-1].strip() if len(text.split()) >= 3 else ""
             async with httpx.AsyncClient() as http:
@@ -204,25 +227,27 @@ async def maybe_handle_summary_command(event: Dict[str, Any]) -> None:
                 if code != ADMIN_CODE:
                     await _send_reply(http, chat_id, "口令错误。")
                     return
-                if not sender_open_id:
-                    await _send_reply(http, chat_id, "无法识别你的 open_id，无法登录为管理员。")
-                    return
-                await _set_admin(sender_open_id)
-                await _send_reply(http, chat_id, "管理员登录成功（6小时）。")
+                if sender_open_id:
+                    await _set_admin(sender_open_id)
+                    await _send_reply(http, chat_id, "管理员登录成功（按用户，6小时）。")
+                else:
+                    await _set_admin_chat(chat_id)
+                    await _send_reply(http, chat_id, "管理员登录成功（按本群，6小时）。")
             return
 
         if low.startswith("#summary logout"):
             if sender_open_id:
                 await _del_admin(sender_open_id)
+            await _del_admin_chat(chat_id)
             async with httpx.AsyncClient() as http:
                 await _send_reply(http, chat_id, "已登出管理员。")
             return
 
         async with AsyncSessionFactory() as db:
-            # 先確保 chat 存在
+            # 确保 chat 存在
             await crud.upsert_chat(db, chat_id, None)
 
-            # ===== 先處理「區間整理」 =====
+            # ===== 区间整理（本群）=====
             if low.startswith("#summary range"):
                 rng = _parse_range(low)
                 if not rng:
@@ -239,9 +264,10 @@ async def maybe_handle_summary_command(event: Dict[str, Any]) -> None:
                     await _summarize_for_chat_in_range(http, chat_id, start, end)
                 return
 
+            # ===== 全群区间整理（管理员）=====
             if low.startswith("#summary all range"):
                 async with httpx.AsyncClient() as http:
-                    if not sender_open_id or not await _is_admin(sender_open_id):
+                    if not await _is_admin_both(sender_open_id, chat_id):
                         await _send_reply(http, chat_id, "没有权限执行此指令，请先 #summary login <code>。")
                         return
                 rng = _parse_range(low)
@@ -260,24 +286,7 @@ async def maybe_handle_summary_command(event: Dict[str, Any]) -> None:
                     await _send_reply(http, chat_id, f"已对 {n} 个群发送区间摘要。")
                 return
 
-            if low.startswith("#summary enable all"):
-                async with httpx.AsyncClient() as http:
-                    if not sender_open_id or not await _is_admin(sender_open_id):
-                        await _send_reply(http, chat_id, "没有权限执行此指令，请先 #summary login <code>。")
-                        return
-                # 將資料庫所有群設為 enabled=True
-                # 借用 get_all_chats 會只回 enabled=True；這裡簡化：再次 upsert + set_chat_enabled
-                # 先取目前所有 seen chats（簡化做法：透過所有 messages 的 chat_id 推測）
-                # 這裡實務上應該在 DB 層提供 get_all_seen_chats；暫以 all_chats=current enabled + 指令所在群
-                async with AsyncSessionFactory() as db2:
-                    # 若你的 crud 有專門方法可拉全部 chats，請替換
-                    # 這裡直接對當前聊天設 enabled=True；其餘群請逐群在群內發 #summary on
-                    await crud.set_chat_enabled(db2, chat_id, True)
-                async with httpx.AsyncClient() as http:
-                    await _send_reply(http, chat_id, "已将本群设为每日摘要启用。")
-                return
-
-            # ===== once / off / on / at / tz / lang =====
+            # ===== once / off / on / at / tz / lang（顺序很重要，先 once）=====
             if low.startswith("#summary once"):
                 async with httpx.AsyncClient() as http:
                     await summarize_for_single_chat(http, chat_id)
@@ -323,13 +332,12 @@ async def maybe_handle_summary_command(event: Dict[str, Any]) -> None:
         logger.debug(f"maybe_handle_summary_command error: {e}")
 
 
-# ======================= 單群摘要（昨日 or 指定範圍） =======================
+# ======================= 单群摘要（昨日/区间） =======================
 async def summarize_for_single_chat(
     http: httpx.AsyncClient, chat_id: str, tz: str | ZoneInfo = DEFAULT_TZ
 ) -> None:
     start, end = _yesterday_range(tz)
     await _summarize_for_chat_in_range(http, chat_id, start, end)
-
 
 async def _summarize_for_chat_in_range(
     http: httpx.AsyncClient, chat_id: str, start: datetime, end: datetime, tz: str | ZoneInfo = DEFAULT_TZ
@@ -342,11 +350,7 @@ async def _summarize_for_chat_in_range(
         await _send_reply(http, chat_id, f"（提示）{tip_day[0]} ~ {tip_day[1]} 无聊天记录，略过摘要。")
         return
 
-    lines = [
-        m.get("text", "")
-        for m in msgs
-        if isinstance(m, dict) and (m.get("text") or "").strip()
-    ]
+    lines = [m.get("text", "") for m in msgs if isinstance(m, dict) and (m.get("text") or "").strip()]
     full_text = "\n".join(lines)
     try:
         summary = await summarize_text_or_fallback(http, full_text)
@@ -357,12 +361,11 @@ async def _summarize_for_chat_in_range(
     await _send_reply(http, chat_id, f"【{tip_day[0]} ~ {tip_day[1]} 历史摘要】\n{summary}")
 
 
-# ======================= 所有群範圍摘要（需要臨時管理員） =======================
+# ======================= 全群区间摘要（管理员） =======================
 async def _summarize_for_all_chats_in_range(http: httpx.AsyncClient, start: datetime, end: datetime) -> int:
     n = 0
-    # 這裡沿用 get_all_chats（enabled=True 的群），若要包含未啟用群，可在 crud 增加方法或在此自定義查詢
     async with AsyncSessionFactory() as db:
-        chats = await crud.get_all_chats(db)
+        chats = await crud.get_all_chats(db)  # 仅 enabled=True 的群
     for c in chats:
         chat_id = c.get("chat_id")
         tz = c.get("tz") or "Asia/Taipei"
@@ -376,7 +379,7 @@ async def _summarize_for_all_chats_in_range(http: httpx.AsyncClient, start: date
     return n
 
 
-# ======================= 每日定時入口（保留原有行為） =======================
+# ======================= 每日定时入口（保留原有行为） =======================
 async def summarize_for_all_chats(http: httpx.AsyncClient) -> None:
     async with AsyncSessionFactory() as db:
         chats = await crud.get_all_chats(db)
@@ -392,3 +395,4 @@ async def summarize_for_all_chats(http: httpx.AsyncClient) -> None:
             await _summarize_for_chat_in_range(http, chat_id, start, end, tz=tz)
         except Exception:
             pass
+
